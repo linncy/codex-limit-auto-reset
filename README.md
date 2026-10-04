@@ -5,6 +5,7 @@ A small tool that monitors Codex rate-limit reset credits and automatically appl
 ## Scheduling and request frequency
 
 - On startup, read the available credits and their expiry times.
+- After a successful check, log the available credit count and the next check time in UTC. This confirms the account query succeeded and the local timer is waiting.
 - Wait locally until `expiresAt - 180 seconds`. Do not redeem before that deadline.
 - Rescan for new credits once every 6 hours, or sooner when a known credit reaches its deadline. There are no server requests while the local timer waits.
 - If started within the final 3 minutes, attempt the reset immediately. Never send a redemption for an expired credit.

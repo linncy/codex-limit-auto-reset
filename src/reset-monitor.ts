@@ -146,6 +146,9 @@ export const runMonitor = async ({
           },
         });
         backoff = INITIAL_BACKOFF_MS;
+        logger.log(
+          `Reset check succeeded; ${lastSnapshot?.rateLimitResetCredits.availableCount ?? 0} available reset credits. Next check: ${new Date(now() + nextCheckInMs).toISOString()} (local timer).`,
+        );
       } catch (error) {
         if (signal.aborted) break;
         client?.close();

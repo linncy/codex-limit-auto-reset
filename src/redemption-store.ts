@@ -13,7 +13,7 @@ const stateSchema = z.record(z.string(), redemptionSchema);
 export type Redemption = z.infer<typeof redemptionSchema>;
 export type RedemptionStore = {
   get: (creditId: string) => Promise<Redemption | undefined>;
-  list: () => Promise<Redemption[]>;
+  list: () => Promise<Array<Redemption & { creditId: string }>>;
   put: (creditId: string, redemption: Redemption) => Promise<void>;
   remove: (creditId: string) => Promise<void>;
   prune: (now: number) => Promise<void>;
@@ -52,7 +52,7 @@ export const createRedemptionStore = (file: string): RedemptionStore => {
 
   return {
     get: async (creditId) => (await load()).get(creditId),
-    list: async () => [...(await load()).values()],
+    list: async () => [...(await load())].map(([creditId, redemption]) => ({ ...redemption, creditId })),
     put: async (creditId, redemption) => {
       const next = new Map(await load());
       next.set(creditId, redemptionSchema.parse(redemption));

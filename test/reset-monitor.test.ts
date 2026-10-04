@@ -27,7 +27,7 @@ const harness = (response = snapshot(credit())) => {
   const entries = new Map<string, Redemption>();
   const store: RedemptionStore = {
     get: vi.fn(async (id) => entries.get(id)),
-    list: vi.fn(async () => [...entries.values()]),
+    list: vi.fn(async () => [...entries].map(([creditId, value]) => ({ ...value, creditId }))),
     put: vi.fn(async (id, value) => {
       entries.set(id, value);
     }),
@@ -149,6 +149,42 @@ describe("redemption outcomes", () => {
     expect(h.entries.get("credit-1")?.completed).toBe(true);
     await h.check();
     expect(h.client.consumeCredit).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    "redeeming",
+    "redeemed",
+    "missing",
+  ] as const)("confirms an uncertain redemption when the credit is %s in the next snapshot", async (status) => {
+    const h = harness();
+    h.client.consumeCredit.mockRejectedValueOnce(Error("timed out"));
+    await expect(h.check()).rejects.toThrow("timed out");
+    const key = h.entries.get("credit-1")?.idempotencyKey;
+    h.client.readCredits.mockResolvedValue(status === "missing" ? snapshot() : snapshot(credit({ status })));
+    h.client.consumeCredit.mockResolvedValueOnce({ outcome: "alreadyRedeemed" });
+    await h.check();
+    expect(h.client.consumeCredit).toHaveBeenCalledTimes(2);
+    expect(h.client.consumeCredit.mock.calls[1]).toEqual(["credit-1", key]);
+    expect(h.entries.get("credit-1")?.completed).toBe(true);
+  });
+
+  it("does not replay an uncertain request after its known expiry", async () => {
+    const h = harness();
+    h.client.consumeCredit.mockRejectedValueOnce(Error("timed out"));
+    await expect(h.check()).rejects.toThrow("timed out");
+    h.client.readCredits.mockResolvedValue(snapshot());
+    vi.setSystemTime(NOW + 180_000);
+    expect(await h.check()).toBe(RESCAN_INTERVAL_MS);
+    expect(h.client.consumeCredit).toHaveBeenCalledOnce();
+  });
+
+  it("respects a shorter expiry returned for an uncertain request", async () => {
+    const h = harness();
+    h.client.consumeCredit.mockRejectedValueOnce(Error("timed out"));
+    await expect(h.check()).rejects.toThrow("timed out");
+    h.client.readCredits.mockResolvedValue(snapshot(credit({ status: "redeeming", expiresAt: NOW / 1000 })));
+    expect(await h.check()).toBe(RESCAN_INTERVAL_MS);
+    expect(h.client.consumeCredit).toHaveBeenCalledOnce();
   });
 
   it("stops retrying at expiry instead of sending a late redemption", async () => {

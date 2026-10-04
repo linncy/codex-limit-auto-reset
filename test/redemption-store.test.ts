@@ -31,6 +31,11 @@ describe("durable redemption state", () => {
     expect(await readdir(directory)).toEqual(["state.json"]);
   });
 
+  it("lists credit IDs alongside pending request keys after restart", async () => {
+    await createRedemptionStore(file).put("credit-1", entry);
+    expect(await createRedemptionStore(file).list()).toEqual([{ ...entry, creditId: "credit-1" }]);
+  });
+
   it("persists success so a stale server snapshot cannot redeem it again", async () => {
     const store = createRedemptionStore(file);
     await store.put("credit-1", entry);

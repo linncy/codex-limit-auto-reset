@@ -6,18 +6,31 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, it, vi } from "vitest";
 
-it("runs the real entrypoint and RPC client at the deadline without contacting Codex services", async () => {
+it.each([
+  "fresh",
+  "uncertain-after-restart",
+] as const)("runs the real entrypoint and RPC client without contacting Codex services: %s", async (scenario) => {
   const directory = await mkdtemp(join(tmpdir(), "codex-reset-process-"));
   const server = join(directory, "mock-codex.mjs");
   const requests = join(directory, "requests.jsonl");
   const state = join(directory, "state.json");
+  const expiresAt = Math.floor(Date.now() / 1000) + 181;
+  const previousKey = "42e61f48-2a63-4080-b254-b367047e28e4";
+  if (scenario === "uncertain-after-restart") {
+    await writeFile(
+      state,
+      JSON.stringify({
+        "integration-credit": { idempotencyKey: previousKey, expiresAtMs: expiresAt * 1000, completed: false },
+      }),
+    );
+  }
   await writeFile(
     server,
     `#!/usr/bin/env node
 import readline from "node:readline";
 import { appendFileSync } from "node:fs";
-const expiresAt = Math.floor(Date.now() / 1000) + 181;
-let redeemed = false;
+const expiresAt = Number(process.env.MOCK_EXPIRES_AT);
+let redeemed = process.env.MOCK_ALREADY_REDEEMED === "true";
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
   appendFileSync(process.env.MOCK_REQUESTS, JSON.stringify({ ...request, time: Date.now(), expiresAt }) + "\\n");
@@ -39,8 +52,8 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       if (Date.now() < expiresAt * 1000 - 180000 || Date.now() >= expiresAt * 1000) {
         throw Error("Redemption outside the permitted window");
       }
+      result = { outcome: redeemed ? "alreadyRedeemed" : "reset" };
       redeemed = true;
-      result = { outcome: "reset" };
       break;
     default: throw Error("Unexpected RPC method " + request.method);
   }
@@ -57,6 +70,8 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       REDEEM_BEFORE_MINUTES: "3",
       STATE_FILE: state,
       MOCK_REQUESTS: requests,
+      MOCK_EXPIRES_AT: String(expiresAt),
+      MOCK_ALREADY_REDEEMED: String(scenario === "uncertain-after-restart"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -81,12 +96,18 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         expect(consume[0].time).toBeGreaterThanOrEqual(consume[0].expiresAt * 1000 - 180_000);
         expect(consume[0].time).toBeLessThan(consume[0].expiresAt * 1000);
         expect(consume[0].params.idempotencyKey).toBe(saved["integration-credit"].idempotencyKey);
-        // Startup read, deadline read, then the required post-reset read.
-        expect(calls.filter((call) => call.method === "account/rateLimits/read")).toHaveLength(3);
+        if (scenario === "uncertain-after-restart") expect(consume[0].params.idempotencyKey).toBe(previousKey);
+        // Startup read, an optional deadline read if startup was early, and
+        // the required post-reset read. A slow startup may already be due.
+        const reads = calls.filter((call) => call.method === "account/rateLimits/read");
+        expect([2, 3]).toContain(reads.length);
+        expect(calls.findLastIndex((call) => call.method === "account/rateLimits/read")).toBeGreaterThan(
+          calls.findIndex((call) => call.method === "account/rateLimitResetCredit/consume"),
+        );
       },
       { timeout: 5_000, interval: 20 },
     );
-    expect(output).toContain("integration-credit: reset");
+    expect(output).toContain(`integration-credit: ${scenario === "fresh" ? "reset" : "alreadyRedeemed"}`);
     const exit = once(child, "exit");
     child.kill("SIGTERM");
     expect(await exit).toEqual([0, null]);

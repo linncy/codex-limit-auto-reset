@@ -53,10 +53,21 @@ export const checkCredits = async ({
 
   while (true) {
     signal?.throwIfAborted();
-    const credits = [];
+    const candidates = new Map<string, { id: string; expiresAtMs: number }>();
     for (const credit of availableCredits(snapshot, now())) {
-      if (!(await store.get(credit.id))?.completed) credits.push(credit);
+      if (!(await store.get(credit.id))?.completed) candidates.set(credit.id, credit);
     }
+    // An uncertain request must be replayed with its original key even when
+    // the service omits the credit or reports it as redeeming/redeemed. The
+    // available-credit list alone cannot confirm an in-flight redemption.
+    for (const pending of await store.list()) {
+      if (pending.completed || pending.expiresAtMs <= now()) continue;
+      const current = snapshot.rateLimitResetCredits.credits.find((credit) => credit.id === pending.creditId);
+      const expiresAtMs = Math.min(pending.expiresAtMs, (current?.expiresAt ?? Infinity) * 1000);
+      if (expiresAtMs > now()) candidates.set(pending.creditId, { id: pending.creditId, expiresAtMs });
+      else candidates.delete(pending.creditId);
+    }
+    const credits = [...candidates.values()].sort((a, b) => a.expiresAtMs - b.expiresAtMs);
     const credit = credits[0];
     if (!credit || credit.expiresAtMs - redeemBeforeMs > now()) {
       if (snapshot.rateLimitResetCredits.availableCount > 0 && !snapshot.rateLimitResetCredits.credits.length) {

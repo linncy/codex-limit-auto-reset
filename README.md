@@ -10,7 +10,7 @@ A small tool that monitors Codex rate-limit reset credits and automatically appl
 - If started within the final 3 minutes, attempt the reset immediately. Never send a redemption for an expired credit.
 - If the server returns `nothingToReset` or `noCredit`, retry every 30 seconds only while the credit remains valid. Successful resets are followed by a fresh account-limit read.
 - After network or process failures, reconnect with exponential backoff from 1 minute to 6 hours. Known pending deadlines shorten the wait; inside the final 3 minutes, retry every 30 seconds.
-- Persist each request's idempotency key before sending it. Ambiguous failures reuse the same key, including after a restart; definitive non-redemptions start a new logical attempt. Completed credits are not retried against stale account data.
+- Persist each request's idempotency key before sending it. Ambiguous failures reuse the same key, including after a restart and when the credit is temporarily missing or reported as redeeming/redeemed; definitive non-redemptions start a new logical attempt. Completed credits are not retried against stale account data.
 
 The service must be running and the machine's clock must be correct. The deadline schedules the attempt; network latency and server eligibility determine when and whether the reset succeeds. The tool cannot force a reset when the server returns `nothingToReset`. Credits without expiry details are not automatically redeemed.
 

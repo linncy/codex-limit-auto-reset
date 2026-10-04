@@ -1,5 +1,10 @@
 services:
   codex-limit-auto-reset:
-    image: ghcr.io/fa0311/codex-limit-auto-reset
+    build: .
+    image: codex-limit-auto-reset:local
     container_name: codex-limit-auto-reset
     restart: unless-stopped
+    environment:
+      REDEEM_BEFORE_MINUTES: "3"
+    volumes:
+      - ${HOME}/.codex:/data/codex

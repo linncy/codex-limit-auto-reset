@@ -16,7 +16,8 @@ FROM node:24-bookworm-slim AS runtime
 RUN npm install --global @openai/codex@0.144.1
 
 ENV CODEX_HOME=/data/codex
-ENV REDEEM_BEFORE_MINUTES=360
+ENV REDEEM_BEFORE_MINUTES=3
+ENV STATE_FILE=/data/codex/.limit-auto-reset-state.json
 
 WORKDIR /app
 COPY package.json ./

@@ -29,7 +29,8 @@ export const createCodexClient = ({ command, clientInfo }: CodexClientOptions) =
     stdout: "pipe",
   });
   const stdin = subprocess.writable();
-  const messages = subprocess.readable().pipe(split2((line: string) => rpcMessageSchema.parse(JSON.parse(line))));
+  const stdout = subprocess.readable();
+  const messages = stdout.pipe(split2((line: string) => rpcMessageSchema.parse(JSON.parse(line))));
 
   let nextId = 1;
   let exitError: Error | undefined;
@@ -45,19 +46,25 @@ export const createCodexClient = ({ command, clientInfo }: CodexClientOptions) =
   };
 
   messages.on("data", (message: RpcMessage) => {
-    if (message.type === "response") {
+    if (message.type === "response" || message.type === "error") {
       const request = pending.get(message.id);
       if (!request) {
         return;
       }
       pending.delete(message.id);
-      request.resolve(message.result);
+      if (message.type === "error") {
+        request.reject(Error(`Codex app-server RPC error ${message.error.code}: ${message.error.message}`));
+      } else {
+        request.resolve(message.result);
+      }
     }
   });
   messages.on("error", rejectAll);
+  stdout.on("error", rejectAll);
+  stdin.on("error", rejectAll);
   void subprocess.then((result) => {
     rejectAll(Error(`Codex app-server exited: ${result.shortMessage}`));
-  });
+  }, rejectAll);
 
   const request = async (method: string, params?: unknown) => {
     if (exitError) {
@@ -71,10 +78,11 @@ export const createCodexClient = ({ command, clientInfo }: CodexClientOptions) =
       pending.delete(id);
       deferred.reject(Error(`Codex app-server request timed out: ${method}`));
     }, REQUEST_TIMEOUT_MS);
-    stdin.write(`${JSON.stringify({ id, method, params })}\n`);
     try {
+      stdin.write(`${JSON.stringify({ id, method, params })}\n`);
       return await deferred.promise;
     } finally {
+      pending.delete(id);
       clearTimeout(timeout);
     }
   };

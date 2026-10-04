@@ -46,6 +46,10 @@ const createHarness = () => {
     respond: (id: number, result: unknown) => {
       stdout.write(`${JSON.stringify({ id, result })}\n`);
     },
+    respondError: (id: number, code: number, message: string) => {
+      stdout.write(`${JSON.stringify({ id, error: { code, message } })}\n`);
+    },
+    breakStdin: () => stdin.emit("error", Error("broken pipe")),
   };
 };
 
@@ -104,6 +108,27 @@ describe("createCodexClient", () => {
     });
     harness.respond(1, { account: { type: "chatgpt", email: null, planType: "plus" }, requiresOpenaiAuth: false });
     await expect(refreshing).resolves.toBeUndefined();
+  });
+
+  it("rejects RPC errors immediately and keeps the connection usable", async () => {
+    const harness = createHarness();
+    const reading = harness.client.readCredits();
+    const expectation = expect(reading).rejects.toThrow("RPC error -32603: unavailable");
+    await harness.line(0);
+    harness.respondError(1, -32603, "unavailable");
+    await expectation;
+    const retry = harness.client.readCredits();
+    await harness.line(1);
+    harness.respond(2, creditsResult);
+    await expect(retry).resolves.toBeDefined();
+  });
+
+  it("rejects pending requests when stdin fails", async () => {
+    const harness = createHarness();
+    const reading = harness.client.readCredits();
+    await harness.line(0);
+    harness.breakStdin();
+    await expect(reading).rejects.toThrow("broken pipe");
   });
 
   it("refreshAccount rejects when logged out", async () => {

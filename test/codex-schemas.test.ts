@@ -44,13 +44,24 @@ describe("rateLimitCreditsSchema", () => {
     });
   });
 
+  it("preserves usedPercent and both quota windows for reminders", () => {
+    const limits = {
+      limitId: "codex",
+      primary: { usedPercent: 19.5, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+      secondary: { usedPercent: 86, windowDurationMins: 10080, resetsAt: null },
+    };
+    const parsed = rateLimitCreditsSchema.parse({ rateLimits: limits, rateLimitsByLimitId: { codex: limits } });
+    expect(parsed.rateLimits).toEqual(limits);
+    expect(parsed.rateLimitsByLimitId?.codex).toEqual(limits);
+  });
+
   it("normalizes a null summary and a null credits list to empty lists", () => {
-    expect(rateLimitCreditsSchema.parse({ rateLimits: {}, rateLimitResetCredits: null })).toEqual({
+    expect(rateLimitCreditsSchema.parse({ rateLimits: {}, rateLimitResetCredits: null })).toMatchObject({
       rateLimitResetCredits: { availableCount: 0, credits: [] },
     });
     expect(
       rateLimitCreditsSchema.parse({ rateLimits: {}, rateLimitResetCredits: { availableCount: 2, credits: null } }),
-    ).toEqual({ rateLimitResetCredits: { availableCount: 2, credits: [] } });
+    ).toMatchObject({ rateLimitResetCredits: { availableCount: 2, credits: [] } });
   });
 
   it("keeps a never-expiring credit as null", () => {

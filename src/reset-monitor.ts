@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { createCodexClient } from "./codex-client.ts";
-import type { RateLimitCredits } from "./codex-schemas.ts";
+import type { ConsumeCredit, RateLimitCredits } from "./codex-schemas.ts";
 import type { RedemptionStore } from "./redemption-store.ts";
+import type { ResetNotifications } from "./reset-notifications.ts";
+import { REMINDER_HOURS } from "./reset-notifications.ts";
 
 export const RESCAN_INTERVAL_MS = 6 * 60 * 60 * 1000;
 export const RETRY_INTERVAL_MS = 30_000;
@@ -18,6 +20,7 @@ type CheckOptions = {
   logger?: Logger;
   signal?: AbortSignal;
   onSnapshot?: (snapshot: RateLimitCredits) => void;
+  notifications?: ResetNotifications;
 };
 
 const availableCredits = (snapshot: RateLimitCredits, now: number) =>
@@ -40,6 +43,7 @@ export const checkCredits = async ({
   logger = console,
   signal,
   onSnapshot,
+  notifications,
 }: CheckOptions): Promise<number> => {
   const redeemBeforeMs = redeemBeforeMinutes * 60_000;
   await store.prune(now());
@@ -57,6 +61,7 @@ export const checkCredits = async ({
     for (const credit of availableCredits(snapshot, now())) {
       if (!(await store.get(credit.id))?.completed) candidates.set(credit.id, credit);
     }
+    const reminderDelay = notifications?.reminders(snapshot, [...candidates.values()]) ?? Infinity;
     // An uncertain request must be replayed with its original key even when
     // the service omits the credit or reports it as redeeming/redeemed. The
     // available-credit list alone cannot confirm an in-flight redemption.
@@ -74,7 +79,10 @@ export const checkCredits = async ({
         logger.warn("Reset credits exist, but expiry details are unavailable; cannot schedule them safely.");
       }
       // Sleep locally until the exact known deadline; do not poll every minute.
-      return Math.max(1, Math.min(RESCAN_INTERVAL_MS, ...credits.map((c) => c.expiresAtMs - redeemBeforeMs - now())));
+      return Math.max(
+        1,
+        Math.min(RESCAN_INTERVAL_MS, reminderDelay, ...credits.map((c) => c.expiresAtMs - redeemBeforeMs - now())),
+      );
     }
 
     const previous = await store.get(credit.id);
@@ -90,18 +98,31 @@ export const checkCredits = async ({
     signal?.throwIfAborted();
     if (credit.expiresAtMs <= now() || credit.expiresAtMs - redeemBeforeMs > now()) continue;
 
-    const { outcome } = await client.consumeCredit(credit.id, redemption.idempotencyKey);
+    let outcome: ConsumeCredit["outcome"];
+    try {
+      ({ outcome } = await client.consumeCredit(credit.id, redemption.idempotencyKey));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      logger.error(`Credit ${credit.id}: reset request failed; result unconfirmed: ${detail}`);
+      notifications?.result(credit, redemption.idempotencyKey, "requestFailed", snapshot, detail);
+      throw error;
+    }
+    // Persist the result/outbox before completing/removing the request key.
+    // On a crash the same key is replayed, and the event ID deduplicates delivery.
+    notifications?.result(credit, redemption.idempotencyKey, outcome, snapshot);
     if (outcome === "reset" || outcome === "alreadyRedeemed") {
       await store.put(credit.id, { ...redemption, completed: true });
-      logger.log(`Credit ${credit.id}: ${outcome}`);
+      logger.log(`Credit ${credit.id}: ${outcome}; reset succeeded.`);
       // Read new quota windows before considering another credit.
       snapshot = await readCredits();
     } else {
       // A definitive non-redemption ends this logical attempt. Use a new key
       // next time, rather than replaying a cached unsuccessful result.
       await store.remove(credit.id);
-      logger.warn(`Credit ${credit.id}: ${outcome}; retrying in 30 seconds while the credit remains valid.`);
-      return Math.max(1, Math.min(RETRY_INTERVAL_MS, credit.expiresAtMs - now()));
+      logger.error(
+        `Credit ${credit.id}: reset FAILED (${outcome}); retrying in 30 seconds while the credit remains valid.`,
+      );
+      return Math.max(1, Math.min(RETRY_INTERVAL_MS, reminderDelay, credit.expiresAtMs - now()));
     }
   }
 };
@@ -119,12 +140,14 @@ export const runMonitor = async ({
   signal,
   now = Date.now,
   logger = console,
+  notifications,
   sleep = async (milliseconds, abortSignal) => {
     await delay(milliseconds, undefined, { signal: abortSignal });
   },
 }: MonitorOptions) => {
   let client: Client | undefined;
   let lastSnapshot: RateLimitCredits | undefined;
+  let lastSnapshotAt = 0;
   let backoff = INITIAL_BACKOFF_MS;
   try {
     while (!signal.aborted) {
@@ -141,13 +164,15 @@ export const runMonitor = async ({
           signal,
           now,
           logger,
+          ...(notifications ? { notifications } : {}),
           onSnapshot: (snapshot) => {
             lastSnapshot = snapshot;
+            lastSnapshotAt = now();
           },
         });
         backoff = INITIAL_BACKOFF_MS;
         logger.log(
-          `Reset check succeeded; ${lastSnapshot?.rateLimitResetCredits.availableCount ?? 0} available reset credits. Next check: ${new Date(now() + nextCheckInMs).toISOString()} (local timer).`,
+          `Account check succeeded; ${lastSnapshot?.rateLimitResetCredits.availableCount ?? 0} available reset credits. Next check: ${new Date(now() + nextCheckInMs).toISOString()} (local timer).`,
         );
       } catch (error) {
         if (signal.aborted) break;
@@ -166,6 +191,14 @@ export const runMonitor = async ({
           for (const credit of [...pending, ...known]) {
             const timeUntilDue = credit.expiresAtMs - redeemBeforeMinutes * 60_000 - now();
             nextCheckInMs = Math.min(nextCheckInMs, timeUntilDue > 0 ? timeUntilDue : RETRY_INTERVAL_MS);
+            if (notifications) {
+              for (const hours of REMINDER_HOURS) {
+                const deadline = credit.expiresAtMs - hours * 3_600_000;
+                if (deadline > lastSnapshotAt) {
+                  nextCheckInMs = Math.min(nextCheckInMs, deadline > now() ? deadline - now() : RETRY_INTERVAL_MS);
+                }
+              }
+            }
           }
         } catch {
           // Keep backing off if local state cannot be read. Do not redeem

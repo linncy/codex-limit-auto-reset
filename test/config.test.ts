@@ -3,13 +3,13 @@ import { parseConfig } from "../src/config.ts";
 
 describe("parseConfig", () => {
   it("applies defaults when nothing is set", () => {
-    expect(parseConfig({})).toEqual({ CODEX_BIN: "codex", REDEEM_BEFORE_MINUTES: 3, STATE_FILE: ".reset-state.json" });
+    expect(parseConfig({})).toEqual({ CODEX_BIN: "codex", REDEEM_BEFORE_MINUTES: 1, STATE_FILE: ".reset-state.json" });
   });
 
   it("parses values from the environment", () => {
-    expect(parseConfig({ CODEX_BIN: "/usr/local/bin/codex", REDEEM_BEFORE_MINUTES: "1" })).toEqual({
+    expect(parseConfig({ CODEX_BIN: "/usr/local/bin/codex", REDEEM_BEFORE_MINUTES: "3" })).toEqual({
       CODEX_BIN: "/usr/local/bin/codex",
-      REDEEM_BEFORE_MINUTES: 1,
+      REDEEM_BEFORE_MINUTES: 3,
       STATE_FILE: ".reset-state.json",
     });
   });

@@ -13,10 +13,16 @@ RUN pnpm prune --prod
 
 FROM node:24-bookworm-slim AS runtime
 
+# Codex needs the OS trust store for HTTPS requests to the account API.
+# Node's bundled CA certificates do not provide a trust store for Codex.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN npm install --global @openai/codex@0.144.1
 
 ENV CODEX_HOME=/data/codex
-ENV REDEEM_BEFORE_MINUTES=3
+ENV REDEEM_BEFORE_MINUTES=1
 ENV STATE_FILE=/data/codex/.limit-auto-reset-state.json
 
 WORKDIR /app

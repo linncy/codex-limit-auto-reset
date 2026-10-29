@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,13 +10,30 @@ import { expect, it, vi } from "vitest";
 it.each([
   "fresh",
   "uncertain-after-restart",
+  "nothing-to-reset",
 ] as const)("runs the real entrypoint and RPC client without contacting Codex services: %s", async (scenario) => {
   const directory = await mkdtemp(join(tmpdir(), "codex-reset-process-"));
   const server = join(directory, "mock-codex.mjs");
   const requests = join(directory, "requests.jsonl");
   const state = join(directory, "state.json");
-  const expiresAt = Math.floor(Date.now() / 1000) + 181;
+  const expiresAt = Math.floor(Date.now() / 1000) + 61;
   const previousKey = "42e61f48-2a63-4080-b254-b367047e28e4";
+  const notifications: Array<{ token: string; text: string }> = [];
+  const chirpy = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      notifications.push(JSON.parse(body));
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end('{"msg":"success"}');
+    });
+  });
+  chirpy.listen(0, "127.0.0.1");
+  await once(chirpy, "listening");
+  const address = chirpy.address();
+  if (!address || typeof address === "string") throw Error("Missing local Chirpy address");
   if (scenario === "uncertain-after-restart") {
     await writeFile(
       state,
@@ -49,11 +67,11 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       },
     }; break;
     case "account/rateLimitResetCredit/consume":
-      if (Date.now() < expiresAt * 1000 - 180000 || Date.now() >= expiresAt * 1000) {
+      if (Date.now() < expiresAt * 1000 - 60000 || Date.now() >= expiresAt * 1000) {
         throw Error("Redemption outside the permitted window");
       }
-      result = { outcome: redeemed ? "alreadyRedeemed" : "reset" };
-      redeemed = true;
+      result = { outcome: process.env.MOCK_OUTCOME || (redeemed ? "alreadyRedeemed" : "reset") };
+      if (result.outcome !== "nothingToReset") redeemed = true;
       break;
     default: throw Error("Unexpected RPC method " + request.method);
   }
@@ -67,11 +85,15 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     env: {
       ...process.env,
       CODEX_BIN: server,
-      REDEEM_BEFORE_MINUTES: "3",
+      REDEEM_BEFORE_MINUTES: "1",
       STATE_FILE: state,
+      CHIRPY_URL: `http://127.0.0.1:${address.port}/send_text`,
+      CHIRPY_TOKEN: "integration-test-token",
+      NOTIFICATION_STATE_FILE: join(directory, "notifications.sqlite"),
       MOCK_REQUESTS: requests,
       MOCK_EXPIRES_AT: String(expiresAt),
       MOCK_ALREADY_REDEEMED: String(scenario === "uncertain-after-restart"),
+      MOCK_OUTCOME: scenario === "nothing-to-reset" ? "nothingToReset" : "",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -86,28 +108,41 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     await vi.waitFor(
       async () => {
         const saved = JSON.parse(await readFile(state, "utf8"));
-        expect(saved["integration-credit"]?.completed).toBe(true);
+        if (scenario === "nothing-to-reset") expect(saved["integration-credit"]).toBeUndefined();
+        else expect(saved["integration-credit"]?.completed).toBe(true);
+        expect(
+          notifications.some((item) =>
+            item.text.includes(scenario === "nothing-to-reset" ? "【Codex 重置失败】" : "【Codex 重置成功】"),
+          ),
+        ).toBe(true);
+        expect(notifications.every((item) => item.token === "integration-test-token")).toBe(true);
         const calls = (await readFile(requests, "utf8"))
           .trim()
           .split("\n")
           .map((line) => JSON.parse(line));
         const consume = calls.filter((call) => call.method === "account/rateLimitResetCredit/consume");
         expect(consume).toHaveLength(1);
-        expect(consume[0].time).toBeGreaterThanOrEqual(consume[0].expiresAt * 1000 - 180_000);
+        expect(consume[0].time).toBeGreaterThanOrEqual(consume[0].expiresAt * 1000 - 60_000);
         expect(consume[0].time).toBeLessThan(consume[0].expiresAt * 1000);
-        expect(consume[0].params.idempotencyKey).toBe(saved["integration-credit"].idempotencyKey);
+        if (scenario !== "nothing-to-reset")
+          expect(consume[0].params.idempotencyKey).toBe(saved["integration-credit"].idempotencyKey);
         if (scenario === "uncertain-after-restart") expect(consume[0].params.idempotencyKey).toBe(previousKey);
         // Startup read, an optional deadline read if startup was early, and
         // the required post-reset read. A slow startup may already be due.
         const reads = calls.filter((call) => call.method === "account/rateLimits/read");
-        expect([2, 3]).toContain(reads.length);
-        expect(calls.findLastIndex((call) => call.method === "account/rateLimits/read")).toBeGreaterThan(
-          calls.findIndex((call) => call.method === "account/rateLimitResetCredit/consume"),
-        );
+        if (scenario === "nothing-to-reset") expect([1, 2]).toContain(reads.length);
+        else {
+          expect([2, 3]).toContain(reads.length);
+          expect(calls.findLastIndex((call) => call.method === "account/rateLimits/read")).toBeGreaterThan(
+            calls.findIndex((call) => call.method === "account/rateLimitResetCredit/consume"),
+          );
+        }
       },
       { timeout: 5_000, interval: 20 },
     );
-    expect(output).toContain(`integration-credit: ${scenario === "fresh" ? "reset" : "alreadyRedeemed"}`);
+    expect(output).toContain(
+      `integration-credit: ${scenario === "nothing-to-reset" ? "reset FAILED (nothingToReset)" : scenario === "fresh" ? "reset" : "alreadyRedeemed"}`,
+    );
     const exit = once(child, "exit");
     child.kill("SIGTERM");
     expect(await exit).toEqual([0, null]);
@@ -118,5 +153,6 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       await exit;
     }
     await rm(directory, { recursive: true, force: true });
+    await new Promise<void>((resolve, reject) => chirpy.close((error) => (error ? reject(error) : resolve())));
   }
 });

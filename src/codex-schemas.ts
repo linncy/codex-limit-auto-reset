@@ -42,8 +42,21 @@ export const accountSchema = z.object({
 });
 export type Account = z.infer<typeof accountSchema>;
 
+const rateLimitWindowSchema = z.object({
+  usedPercent: z.number().finite(),
+  windowDurationMins: z.number().nullish(),
+  resetsAt: z.number().nullish(),
+});
+const rateLimitSnapshotSchema = z.object({
+  limitId: z.string().nullish(),
+  primary: rateLimitWindowSchema.nullish(),
+  secondary: rateLimitWindowSchema.nullish(),
+});
+
 // GetAccountRateLimitsResponse.rateLimitResetCredits: summary and its credits list are both nullable.
 export const rateLimitCreditsSchema = z.object({
+  rateLimits: rateLimitSnapshotSchema.nullish(),
+  rateLimitsByLimitId: z.record(z.string(), rateLimitSnapshotSchema.nullable()).nullish(),
   rateLimitResetCredits: z
     .object({
       availableCount: z.int(),

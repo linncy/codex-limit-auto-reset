@@ -8,6 +8,7 @@ import {
   RETRY_INTERVAL_MS,
   runMonitor,
 } from "../src/reset-monitor.ts";
+import type { ResetNotifications } from "../src/reset-notifications.ts";
 
 type Credit = RateLimitCredits["rateLimitResetCredits"]["credits"][number];
 const NOW = 1_800_000_000_000;
@@ -16,7 +17,7 @@ const credit = (overrides: Partial<Credit> = {}): Credit => ({
   status: "available",
   resetType: "codexRateLimits",
   grantedAt: NOW / 1000 - 86_400,
-  expiresAt: NOW / 1000 + 180,
+  expiresAt: NOW / 1000 + 60,
   ...overrides,
 });
 const snapshot = (...credits: Credit[]): RateLimitCredits => ({
@@ -48,7 +49,8 @@ const harness = (response = snapshot(credit())) => {
     })),
   };
   const logger = { log: vi.fn(), warn: vi.fn(), error: vi.fn() };
-  const check = () => checkCredits({ client, store, redeemBeforeMinutes: 3, logger });
+  const check = (notifications?: ResetNotifications) =>
+    checkCredits({ client, store, redeemBeforeMinutes: 1, logger, ...(notifications ? { notifications } : {}) });
   return { client, entries, store, logger, check };
 };
 
@@ -58,7 +60,7 @@ beforeEach(() => {
 });
 afterEach(() => vi.useRealTimers());
 
-describe("three-minute redemption window", () => {
+describe("one-minute redemption window", () => {
   it("does not redeem even one millisecond before the deadline", async () => {
     vi.setSystemTime(NOW - 1);
     const h = harness();
@@ -66,7 +68,7 @@ describe("three-minute redemption window", () => {
     expect(h.client.consumeCredit).not.toHaveBeenCalled();
   });
 
-  it("redeems exactly at the three-minute boundary and reads updated limits", async () => {
+  it("redeems exactly at the one-minute boundary and reads updated limits", async () => {
     const h = harness();
     expect(await h.check()).toBe(RESCAN_INTERVAL_MS);
     expect(h.client.consumeCredit).toHaveBeenCalledOnce();
@@ -76,8 +78,8 @@ describe("three-minute redemption window", () => {
     expect(h.entries.get("credit-1")?.completed).toBe(true);
   });
 
-  it("catches up when started within the final three minutes", async () => {
-    vi.setSystemTime(NOW + 90_000);
+  it("catches up when started within the final minute", async () => {
+    vi.setSystemTime(NOW + 30_000);
     const h = harness();
     await h.check();
     expect(h.client.consumeCredit).toHaveBeenCalledOnce();
@@ -100,7 +102,7 @@ describe("three-minute redemption window", () => {
     const h = harness();
     vi.mocked(h.store.put).mockImplementation(async (id, value) => {
       h.entries.set(id, value);
-      vi.setSystemTime(NOW + 180_000);
+      vi.setSystemTime(NOW + 60_000);
     });
     await h.check();
     expect(h.client.consumeCredit).not.toHaveBeenCalled();
@@ -125,6 +127,63 @@ describe("three-minute redemption window", () => {
 });
 
 describe("redemption outcomes", () => {
+  it.each([
+    "reset",
+    "alreadyRedeemed",
+    "nothingToReset",
+    "noCredit",
+  ] as const)("records and notifies the %s result before finalizing the request", async (outcome) => {
+    const h = harness();
+    h.client.consumeCredit.mockResolvedValueOnce({ outcome });
+    const notifications = { reminders: vi.fn(() => Infinity), result: vi.fn() };
+    await h.check(notifications);
+    expect(notifications.result).toHaveBeenCalledWith(
+      { id: "credit-1", expiresAtMs: NOW + 60_000 },
+      expect.any(String),
+      outcome,
+      expect.any(Object),
+    );
+    const notificationOrder = notifications.result.mock.invocationCallOrder[0] as number;
+    if (outcome === "nothingToReset" || outcome === "noCredit") {
+      expect(h.logger.error).toHaveBeenCalledWith(expect.stringContaining(`reset FAILED (${outcome})`));
+      expect(notificationOrder).toBeLessThan(vi.mocked(h.store.remove).mock.invocationCallOrder[0] as number);
+    } else {
+      expect(notificationOrder).toBeLessThan(vi.mocked(h.store.put).mock.invocationCallOrder[1] as number);
+    }
+  });
+
+  it("notifies ambiguous request failures without losing the replay key", async () => {
+    const h = harness();
+    h.client.consumeCredit.mockRejectedValueOnce(Error("timed out"));
+    const notifications = { reminders: vi.fn(() => Infinity), result: vi.fn() };
+    await expect(h.check(notifications)).rejects.toThrow("timed out");
+    expect(notifications.result).toHaveBeenCalledWith(
+      expect.any(Object),
+      h.entries.get("credit-1")?.idempotencyKey,
+      "requestFailed",
+      expect.any(Object),
+      "timed out",
+    );
+    expect(h.logger.error).toHaveBeenCalledWith(expect.stringContaining("result unconfirmed"));
+  });
+
+  it("retains the request for replay if persisting a successful result fails", async () => {
+    const h = harness();
+    const notifications = {
+      reminders: vi.fn(() => Infinity),
+      result: vi.fn<ResetNotifications["result"]>(() => {
+        throw Error("disk full");
+      }),
+    };
+    await expect(h.check(notifications)).rejects.toThrow("disk full");
+    expect(h.entries.get("credit-1")?.completed).toBe(false);
+    const key = h.entries.get("credit-1")?.idempotencyKey;
+    notifications.result.mockImplementation(() => {});
+    h.client.consumeCredit.mockResolvedValueOnce({ outcome: "alreadyRedeemed" });
+    await h.check(notifications);
+    expect(h.client.consumeCredit.mock.calls[1]?.[1]).toBe(key);
+    expect(h.entries.get("credit-1")?.completed).toBe(true);
+  });
   it.each(["nothingToReset", "noCredit"] as const)("retries %s with a new logical request key", async (outcome) => {
     const h = harness();
     h.client.consumeCredit.mockResolvedValueOnce({ outcome });
@@ -173,7 +232,7 @@ describe("redemption outcomes", () => {
     h.client.consumeCredit.mockRejectedValueOnce(Error("timed out"));
     await expect(h.check()).rejects.toThrow("timed out");
     h.client.readCredits.mockResolvedValue(snapshot());
-    vi.setSystemTime(NOW + 180_000);
+    vi.setSystemTime(NOW + 60_000);
     expect(await h.check()).toBe(RESCAN_INTERVAL_MS);
     expect(h.client.consumeCredit).toHaveBeenCalledOnce();
   });
@@ -190,15 +249,15 @@ describe("redemption outcomes", () => {
   it("stops retrying at expiry instead of sending a late redemption", async () => {
     const h = harness();
     h.client.consumeCredit.mockResolvedValueOnce({ outcome: "nothingToReset" });
-    vi.setSystemTime(NOW + 170_000);
+    vi.setSystemTime(NOW + 50_000);
     expect(await h.check()).toBe(10_000);
-    vi.setSystemTime(NOW + 180_000);
+    vi.setSystemTime(NOW + 60_000);
     expect(await h.check()).toBe(RESCAN_INTERVAL_MS);
     expect(h.client.consumeCredit).toHaveBeenCalledOnce();
   });
 
   it("tries the soonest-expiring credit first and refreshes before the next credit", async () => {
-    const earlier = credit({ id: "earlier", expiresAt: NOW / 1000 + 100 });
+    const earlier = credit({ id: "earlier", expiresAt: NOW / 1000 + 40 });
     const later = credit({ id: "later" });
     const h = harness(snapshot(later, earlier));
     h.client.readCredits.mockResolvedValueOnce(snapshot(later, earlier)).mockResolvedValueOnce(snapshot(later));
@@ -224,6 +283,12 @@ describe("redemption outcomes", () => {
 });
 
 describe("request frequency and recovery", () => {
+  it("wakes for a reminder sooner than the six-hour rescan without redeeming early", async () => {
+    const h = harness(snapshot(credit({ expiresAt: NOW / 1000 + 49 * 3600 })));
+    const notifications = { reminders: vi.fn(() => 3_600_000), result: vi.fn() };
+    expect(await h.check(notifications)).toBe(3_600_000);
+    expect(h.client.consumeCredit).not.toHaveBeenCalled();
+  });
   it("waits six hours between routine scans", async () => {
     const h = harness(snapshot());
     const controller = new AbortController();
@@ -231,7 +296,7 @@ describe("request frequency and recovery", () => {
     await runMonitor({
       createClient: () => h.client,
       store: h.store,
-      redeemBeforeMinutes: 3,
+      redeemBeforeMinutes: 1,
       logger: h.logger,
       signal: controller.signal,
       sleep: async (ms) => {
@@ -247,13 +312,13 @@ describe("request frequency and recovery", () => {
   });
 
   it("uses a local timer for a known deadline without intervening server requests", async () => {
-    const h = harness(snapshot(credit({ expiresAt: NOW / 1000 + 185 })));
+    const h = harness(snapshot(credit({ expiresAt: NOW / 1000 + 65 })));
     const controller = new AbortController();
     const waits: number[] = [];
     await runMonitor({
       createClient: () => h.client,
       store: h.store,
-      redeemBeforeMinutes: 3,
+      redeemBeforeMinutes: 1,
       logger: h.logger,
       signal: controller.signal,
       sleep: async (ms) => {
@@ -278,7 +343,7 @@ describe("request frequency and recovery", () => {
     await runMonitor({
       createClient: () => h.client,
       store: h.store,
-      redeemBeforeMinutes: 3,
+      redeemBeforeMinutes: 1,
       logger: h.logger,
       signal: controller.signal,
       sleep: async (ms) => {
@@ -291,16 +356,16 @@ describe("request frequency and recovery", () => {
   });
 
   it("keeps retries within the known redemption window after a server failure", async () => {
-    const h = harness(snapshot(credit({ expiresAt: NOW / 1000 + 200 })));
+    const h = harness(snapshot(credit({ expiresAt: NOW / 1000 + 80 })));
     h.client.readCredits
-      .mockResolvedValueOnce(snapshot(credit({ expiresAt: NOW / 1000 + 200 })))
+      .mockResolvedValueOnce(snapshot(credit({ expiresAt: NOW / 1000 + 80 })))
       .mockRejectedValueOnce(Error("offline"));
     const controller = new AbortController();
     const waits: number[] = [];
     await runMonitor({
       createClient: () => h.client,
       store: h.store,
-      redeemBeforeMinutes: 3,
+      redeemBeforeMinutes: 1,
       logger: h.logger,
       signal: controller.signal,
       sleep: async (ms) => {
@@ -316,7 +381,7 @@ describe("request frequency and recovery", () => {
     const h = harness();
     h.entries.set("credit-1", {
       idempotencyKey: "42e61f48-2a63-4080-b254-b367047e28e4",
-      expiresAtMs: NOW + 180_000,
+      expiresAtMs: NOW + 60_000,
       completed: false,
     });
     h.client.initialize.mockRejectedValue(Error("offline"));
@@ -325,7 +390,7 @@ describe("request frequency and recovery", () => {
     await runMonitor({
       createClient: () => h.client,
       store: h.store,
-      redeemBeforeMinutes: 3,
+      redeemBeforeMinutes: 1,
       signal: controller.signal,
       logger: h.logger,
       sleep,
@@ -341,7 +406,7 @@ describe("request frequency and recovery", () => {
     await runMonitor({
       createClient: () => h.client,
       store: h.store,
-      redeemBeforeMinutes: 3,
+      redeemBeforeMinutes: 1,
       signal: controller.signal,
       logger: h.logger,
       sleep,
@@ -357,7 +422,7 @@ describe("request frequency and recovery", () => {
     await runMonitor({
       createClient: () => h.client,
       store: h.store,
-      redeemBeforeMinutes: 3,
+      redeemBeforeMinutes: 1,
       logger: h.logger,
       signal: controller.signal,
       sleep: async () => {

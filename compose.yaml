@@ -5,6 +5,6 @@ services:
     container_name: codex-limit-auto-reset
     restart: unless-stopped
     environment:
-      REDEEM_BEFORE_MINUTES: "3"
+      REDEEM_BEFORE_MINUTES: "1"
     volumes:
       - ${HOME}/.codex:/data/codex

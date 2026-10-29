@@ -14,10 +14,12 @@
     "start": "node --env-file-if-exists=.env src/main.ts",
     "start:cli": "node --env-file-if-exists=.env src/cli.ts",
     "build": "tsc -p tsconfig.build.json",
-    "check": "pnpm typecheck && pnpm lint && pnpm test",
+    "check": "pnpm typecheck && pnpm lint && pnpm test && pnpm test:deployment",
     "format": "biome format --write .",
     "lint": "biome check .",
     "test": "vitest run",
+    "test:deployment": "bash -n install.sh uninstall.sh && python3 -m unittest discover -s test -p 'test_deployment.py' -v",
+    "test:deployment:docker": "python3 test/deployment_smoke.py",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

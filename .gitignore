@@ -3,3 +3,5 @@ node_modules
 .reset-state.json
 .reset-state.json.*.tmp
 *.notifications.sqlite*
+__pycache__/
+*.pyc
